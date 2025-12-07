@@ -1,105 +1,24 @@
-use crate::types::{ConsensusInput, HybridTx, NarwhalBatch};
+use crate::{router, types::CrossChainMessage};
 use anyhow::Result;
-use libp2p::{
-    gossipsub::{self, Gossipsub, GossipsubEvent, IdentTopic, MessageAuthenticity},
-    identity,
-    swarm::{NetworkBehaviour, SwarmBuilder, SwarmEvent},
-    tcp, yamux, PeerId, Swarm,
-};
-use libp2p::Transport;
-use libp2p::swarm::NetworkBehaviour;
-use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use tokio::sync::mpsc::Sender;
-use tracing::{info, warn};
+use tokio::sync::mpsc;
+use tracing::{error, info};
 
-const TOPIC_TX: &str = "eth-narwhal-tx";
-const TOPIC_BATCH: &str = "eth-narwhal-batch";
+/// Handle used by RPC to enqueue cross-chain messages.
+pub type P2PHandle = mpsc::Sender<CrossChainMessage>;
 
-#[derive(NetworkBehaviour)]
-pub struct NodeBehaviour {
-    gossipsub: Gossipsub,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-enum GossipMessage {
-    Tx(HybridTx),
-    Batch(NarwhalBatch),
-}
-
-pub async fn spawn_p2p(
-    listen_addr: &str,
-    consensus_tx: Sender<ConsensusInput>,
-) -> Result<()> {
-    let local_key = identity::Keypair::generate_ed25519();
-    let local_peer_id = PeerId::from(local_key.public());
-    info!("Local peer id: {local_peer_id}");
-
-    let transport = tcp::tokio::Transport::new(tcp::Config::default())
-        .upgrade(libp2p::core::upgrade::Version::V1Lazy)
-        .authenticate(libp2p::noise::Config::new(
-            &local_key
-        )?)
-        .multiplex(yamux::Config::default())
-        .boxed();
-
-    let gossipsub_config = gossipsub::ConfigBuilder::default()
-        .heartbeat_interval(Duration::from_secs(1))
-        .validation_mode(gossipsub::ValidationMode::Permissive)
-        .build()
-        .expect("valid gossipsub config");
-
-    let mut gossipsub = Gossipsub::new(
-        MessageAuthenticity::Signed(local_key.clone()),
-        gossipsub_config,
-    )?;
-
-    let tx_topic = IdentTopic::new(TOPIC_TX);
-    let batch_topic = IdentTopic::new(TOPIC_BATCH);
-
-    gossipsub.subscribe(&tx_topic)?;
-    gossipsub.subscribe(&batch_topic)?;
-
-    let behaviour = NodeBehaviour { gossipsub };
-
-    let mut swarm = SwarmBuilder::with_tokio_executor(transport, behaviour, local_peer_id)
-        .build();
-
-    swarm.listen_on(listen_addr.parse()?)?;
+/// Spawns a background task that receives messages and routes them.
+/// For now this is a local in-process queue (no libp2p transport yet).
+pub async fn spawn_p2p() -> Result<P2PHandle> {
+    let (tx, mut rx) = mpsc::channel::<CrossChainMessage>(128);
 
     tokio::spawn(async move {
-        loop {
-            match swarm.select_next_some().await {
-                SwarmEvent::Behaviour(NodeBehaviourEvent::Gossipsub(
-                    GossipsubEvent::Message { message, .. },
-                )) => {
-                    if let Ok(msg) = serde_json::from_slice::<GossipMessage>(&message.data) {
-                        match msg {
-                            GossipMessage::Tx(tx) => {
-                                let _ = consensus_tx
-                                    .send(ConsensusInput::NewTx(tx))
-                                    .await;
-                            }
-                            GossipMessage::Batch(batch) => {
-                                let _ = consensus_tx
-                                    .send(ConsensusInput::NarwhalBatch(batch))
-                                    .await;
-                            }
-                        }
-                    }
-                }
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    info!("Listening on {address}");
-                }
-                e => {
-                    if cfg!(debug_assertions) {
-                        warn!("Swarm event: {e:?}");
-                    }
-                }
+        while let Some(msg) = rx.recv().await {
+            if let Err(e) = router::route_message(msg).await {
+                error!("Failed to route message: {e:?}");
             }
         }
     });
 
-    Ok(())
+    info!("P2P message loop started (local channel only, no libp2p yet)");
+    Ok(tx)
 }
-
